@@ -71,6 +71,16 @@ typedef struct list_t {
 static list_t buckets[BUCKET_COUNT];
 
 /*
+ * We could initialize the allocator by giving it one free block the size of
+ * the entire address space. However, this would cause us to instantly reserve
+ * half of the entire address space on the first allocation, since the first
+ * split would store a free list entry at the start of the right child of the
+ * root. Instead, we have the tree start out small and grow the size of the
+ * tree as we use more memory. The size of the tree is tracked by this value.
+ */
+static size_t bucket_limit;
+
+/*
  * This array represents a linearized binary tree of bits. Every possible
  * allocation larger than MIN_ALLOC has a node in this tree (and therefore a
  * bit in this array).
@@ -190,14 +200,20 @@ static uint8_t *ptr_for_node(size_t index, size_t bucket) {
 static size_t node_for_ptr(uint8_t *ptr, size_t bucket) {
   return ((ptr - base_ptr) >> (MAX_ALLOC_LOG2 - bucket)) + (1 << bucket) - 1;
 }
+/*
+ * Given the index of a node, this returns the "is split" flag of the parent.
+ */
+static int parent_is_split(size_t index) {
+  index = (index - 1) / 2;
+  return (node_is_split[index / 8] >> (index % 8)) & 1;
+}
 
 /*
- * Given the index of a node, this flips the "is split" flag of the parent and
- * returns the new value of that flag.
+ * Given the index of a node, this flips the "is split" flag of the parent.
  */
-static int flip_parent_is_split(size_t index) {
+static void flip_parent_is_split(size_t index) {
   index = (index - 1) / 2;
-  return node_is_split[index / 8] ^= 1 << (index % 8);
+  node_is_split[index / 8] ^= 1 << (index % 8);
 }
 
 /*
@@ -216,8 +232,59 @@ static size_t bucket_for_request(size_t request) {
   return bucket;
 }
 
-uint8_t *buddy_malloc(size_t request) {
-  size_t original_bucket, bucket, i;
+/*
+ * The tree is always rooted at the current bucket limit. This call grows the
+ * tree by repeatedly doubling it in size until the root lies at the provided
+ * bucket index. Each doubling lowers the bucket limit by 1.
+ */
+static int lower_bucket_limit(size_t bucket) {
+  while (bucket < bucket_limit) {
+    size_t root = node_for_ptr(base_ptr, bucket_limit);
+    uint8_t *right_child;
+
+    /*
+     * If the parent isn't SPLIT, that means the node at the current bucket
+     * limit is UNUSED and our address space is entirely free. In that case,
+     * clear the root free list, increase the bucket limit, and add a single
+     * block with the newly-expanded address space to the new root free list.
+     */
+    if (!parent_is_split(root)) {
+      list_remove((list_t *)base_ptr);
+      list_init(&buckets[--bucket_limit]);
+      list_push(&buckets[bucket_limit], (list_t *)base_ptr);
+      continue;
+    }
+
+    /*
+     * Otherwise, the tree is currently in use. Create a parent node for the
+     * current root node in the SPLIT state with a right child on the free
+     * list. Make sure to reserve the memory for the free list entry before
+     * writing to it. Note that we do not need to flip the "is split" flag for
+     * our current parent because it's already on (we know because we just
+     * checked it above).
+     */
+    right_child = ptr_for_node(root + 1, bucket_limit);
+    if (!update_max_ptr(right_child + sizeof(list_t))) {
+      return 0;
+    }
+    list_push(&buckets[bucket_limit], (list_t *)right_child);
+    list_init(&buckets[--bucket_limit]);
+
+    /*
+     * Set the grandparent's SPLIT flag so if we need to lower the bucket limit
+     * again, we'll know that the new root node we just added is in use.
+     */
+    root = (root - 1) / 2;
+    if (root != 0) {
+      flip_parent_is_split(root);
+    }
+  }
+
+  return 1;
+}
+
+void *malloc(size_t request) {
+  size_t original_bucket, bucket;
 
   /*
    * Make sure it's possible for an allocation of this size to succeed. There's
@@ -226,6 +293,19 @@ uint8_t *buddy_malloc(size_t request) {
    */
   if (request + HEADER_SIZE > MAX_ALLOC) {
     return NULL;
+  }
+
+  /*
+   * Initialize our global state if this is the first call to "malloc". At the
+   * beginning, the tree has a single node that represents the smallest
+   * possible allocation size. More memory will be reserved later as needed.
+   */
+  if (base_ptr == NULL) {
+    base_ptr = max_ptr = sbrk(0);
+    bucket_limit = BUCKET_COUNT - 1;
+    update_max_ptr(base_ptr + sizeof(list_t));
+    list_init(&buckets[BUCKET_COUNT - 1]);
+    list_push(&buckets[BUCKET_COUNT - 1], (list_t *)base_ptr);
   }
 
   /*
@@ -241,16 +321,43 @@ uint8_t *buddy_malloc(size_t request) {
    * larger one to get a match.
    */
   while (bucket + 1 != 0) {
-    uint8_t *ptr = (uint8_t *)list_pop(&buckets[bucket]);
-    size_t size, bytes_needed;
+    size_t size, bytes_needed, i;
+    uint8_t *ptr;
 
     /*
-     * If the free list for this bucket is empty, check the free list for the
-     * next largest bucket instead.
+     * We may need to grow the tree to be able to fit an allocation of this
+     * size. Try to grow the tree and stop here if we can't.
      */
+    if (!lower_bucket_limit(bucket)) {
+      return NULL;
+    }
+
+    /*
+     * Try to pop a block off the free list for this bucket. If the free list
+     * is empty, we're going to have to split a larger block instead.
+     */
+    ptr = (uint8_t *)list_pop(&buckets[bucket]);
     if (!ptr) {
-      bucket--;
-      continue;
+      /*
+       * If we're not at the root of the tree or it's impossible to grow the
+       * tree any more, continue on to the next bucket.
+       */
+      if (bucket != bucket_limit || bucket == 0) {
+        bucket--;
+        continue;
+      }
+
+      /*
+       * Otherwise, grow the tree one more level and then pop a block off the
+       * free list again. Since we know the root of the tree is used (because
+       * the free list was empty), this will add a parent above this node in
+       * the SPLIT state and then add the new right child node to the free list
+       * for this bucket. Popping the free list will give us this right child.
+       */
+      if (!lower_bucket_limit(bucket - 1)) {
+        return NULL;
+      }
+      ptr = (uint8_t *)list_pop(&buckets[bucket]);
     }
 
     /*
@@ -305,7 +412,7 @@ uint8_t *buddy_malloc(size_t request) {
   return NULL;
 }
 
-void buddy_free(uint8_t *ptr) {
+void free(void *ptr) {
   size_t bucket, i;
 
   /*
@@ -313,7 +420,7 @@ void buddy_free(uint8_t *ptr) {
    * address of the node by subtracting off the size of the block header. Then
    * look up the index of the node corresponding to this address.
    */
-  ptr -= HEADER_SIZE;
+  ptr = (uint8_t *)ptr - HEADER_SIZE;
   bucket = bucket_for_request(*(size_t *)ptr + HEADER_SIZE);
   i = node_for_ptr(ptr, bucket);
 
@@ -327,12 +434,18 @@ void buddy_free(uint8_t *ptr) {
      * parent's "is split" bit because that bit is the exclusive-or of the
      * UNUSED flags of both children, and our UNUSED flag (which isn't ever
      * stored explicitly) has just changed.
-     *
+     */
+    flip_parent_is_split(i);
+
+    /*
      * If the parent is now SPLIT, that means our buddy is USED, so don't merge
      * with it. Instead, stop the iteration here and add ourselves to the free
      * list for our bucket.
+     *
+     * Also stop here if we're at the current root node, even if that root node
+     * is now UNUSED. Root nodes don't have a buddy so we can't merge with one.
      */
-    if (flip_parent_is_split(i)) {
+    if (parent_is_split(i) || bucket == bucket_limit) {
       break;
     }
 
@@ -355,35 +468,4 @@ void buddy_free(uint8_t *ptr) {
    * for better memory locality.
    */
   list_push(&buckets[bucket], (list_t *)ptr_for_node(i, bucket));
-}
-
-/*
- * Initialize the state of the allocator. This must be called before any
- * allocations happen. Note that this relies on static global memory being
- * zero-initialized by the compiler.
- */
-void buddy_init() {
-  size_t i;
-
-  /*
-   * At the beginning, most of our memory is unreserved. We only need to
-   * reserve space for a single free list entry for the root node, which
-   * represents the entire address space.
-   */
-  base_ptr = max_ptr = sbrk(0);
-  update_max_ptr(base_ptr + sizeof(list_t));
-
-  /*
-   * Free lists are circular linked lists, so each list defaults to pointing to
-   * itself instead of pointing to null. These pointers are initialized here.
-   */
-  for (i = 0; i < BUCKET_COUNT; i++) {
-    list_init(&buckets[i]);
-  }
-
-  /*
-   * Push a single block onto the free list for the largest bucket. This block
-   * represents the entire address space.
-   */
-  list_push(&buckets[0], (list_t *)base_ptr);
 }
