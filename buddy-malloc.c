@@ -30,7 +30,7 @@
  * we need to stay 8-byte aligned.
  */
 #define MIN_ALLOC_LOG2 4
-#define MIN_ALLOC ((size_t)1 << (size_t)MIN_ALLOC_LOG2)
+#define MIN_ALLOC ((size_t)1 << MIN_ALLOC_LOG2)
 
 /*
  * The maximum allocation size is currently set to 2gb. This is the total size
@@ -40,12 +40,15 @@
  * is at most 1gb.
  */
 #define MAX_ALLOC_LOG2 31
-#define MAX_ALLOC ((size_t)1 << (size_t)MAX_ALLOC_LOG2)
+#define MAX_ALLOC ((size_t)1 << MAX_ALLOC_LOG2)
 
 /*
  * Allocations are done in powers of two starting from MIN_ALLOC and ending at
  * MAX_ALLOC inclusive. Each allocation size has a bucket that stores the free
  * list for that allocation size.
+ *
+ * Given a bucket index, the size of the allocations in that bucket can be
+ * found with "(size_t)1 << (MAX_ALLOC_LOG2 - bucket)".
  */
 #define BUCKET_COUNT (MAX_ALLOC_LOG2 - MIN_ALLOC_LOG2 + 1)
 
@@ -171,22 +174,21 @@ static list_t *list_pop(list_t *list) {
 
 /*
  * This maps from the index of a node to the address of memory that node
- * represents. The bucket and size can be derived from the index using a loop
- * but are required to be provided here since having them means we can avoid
- * the loop and have this function return in constant time.
+ * represents. The bucket can be derived from the index using a loop but is
+ * required to be provided here since having them means we can avoid the loop
+ * and have this function return in constant time.
  */
-static list_t *ptr_for_node(size_t index, size_t bucket, size_t size) {
-  return (list_t *)(base_ptr + (index - (1 << bucket) + 1) * size);
+static uint8_t *ptr_for_node(size_t index, size_t bucket) {
+  return base_ptr + ((index - (1 << bucket) + 1) << (MAX_ALLOC_LOG2 - bucket));
 }
 
 /*
  * This maps from an address of memory to the node that represents that
  * address. There are often many nodes that all map to the same address, so
- * more information than just the address is needed to uniquely identify a
- * node.
+ * the bucket is needed to uniquely identify a node.
  */
-static size_t node_for_ptr(uint8_t *ptr, size_t bucket, size_t size) {
-  return (ptr - base_ptr) / size + (1 << bucket) - 1;
+static size_t node_for_ptr(uint8_t *ptr, size_t bucket) {
+  return ((ptr - base_ptr) >> (MAX_ALLOC_LOG2 - bucket)) + (1 << bucket) - 1;
 }
 
 /*
@@ -199,25 +201,23 @@ static int flip_parent_is_split(size_t index) {
 }
 
 /*
- * Given the requested size passed to "malloc", this function fills in both the
- * index of the smallest bucket that can fit that size and the size of that
- * bucket.
+ * Given the requested size passed to "malloc", this function returns the index
+ * of the smallest bucket that can fit that size.
  */
-static void get_bucket_and_size(size_t request, size_t *bucket, size_t *size) {
-  size_t b = BUCKET_COUNT - 1;
-  size_t s = MIN_ALLOC;
+static size_t bucket_for_request(size_t request) {
+  size_t bucket = BUCKET_COUNT - 1;
+  size_t size = MIN_ALLOC;
 
-  while (s < request) {
-    b--;
-    s *= 2;
+  while (size < request) {
+    bucket--;
+    size *= 2;
   }
 
-  *bucket = b;
-  *size = s;
+  return bucket;
 }
 
 uint8_t *buddy_malloc(size_t request) {
-  size_t original_bucket, bucket, size, i, bytes_needed;
+  size_t original_bucket, bucket, i;
 
   /*
    * Make sure it's possible for an allocation of this size to succeed. There's
@@ -232,7 +232,7 @@ uint8_t *buddy_malloc(size_t request) {
    * Find the smallest bucket that will fit this request. This doesn't check
    * that there's space for the request yet.
    */
-  get_bucket_and_size(request + HEADER_SIZE, &bucket, &size);
+  bucket = bucket_for_request(request + HEADER_SIZE);
   original_bucket = bucket;
 
   /*
@@ -242,6 +242,7 @@ uint8_t *buddy_malloc(size_t request) {
    */
   while (bucket + 1 != 0) {
     uint8_t *ptr = (uint8_t *)list_pop(&buckets[bucket]);
+    size_t size, bytes_needed;
 
     /*
      * If the free list for this bucket is empty, check the free list for the
@@ -249,7 +250,6 @@ uint8_t *buddy_malloc(size_t request) {
      */
     if (!ptr) {
       bucket--;
-      size *= 2;
       continue;
     }
 
@@ -257,6 +257,7 @@ uint8_t *buddy_malloc(size_t request) {
      * Try to expand the address space first before going any further. If we
      * have run out of space, put this block back on the free list and fail.
      */
+    size = (size_t)1 << (MAX_ALLOC_LOG2 - bucket);
     bytes_needed = bucket < original_bucket ? size / 2 + sizeof(list_t) : size;
     if (!update_max_ptr(ptr + bytes_needed)) {
       list_push(&buckets[bucket], (list_t *)ptr);
@@ -274,7 +275,7 @@ uint8_t *buddy_malloc(size_t request) {
      * grandparent to be UNUSED (if our buddy chunk was UNUSED, our parent
      * wouldn't ever have been split in the first place).
      */
-    i = node_for_ptr(ptr, bucket, size);
+    i = node_for_ptr(ptr, bucket);
     if (i != 0) {
       flip_parent_is_split(i);
     }
@@ -289,9 +290,8 @@ uint8_t *buddy_malloc(size_t request) {
     while (bucket < original_bucket) {
       i = i * 2 + 1;
       bucket++;
-      size /= 2;
       flip_parent_is_split(i);
-      list_push(&buckets[bucket], ptr_for_node(i + 1, bucket, size));
+      list_push(&buckets[bucket], (list_t *)ptr_for_node(i + 1, bucket));
     }
 
     /*
@@ -306,7 +306,7 @@ uint8_t *buddy_malloc(size_t request) {
 }
 
 void buddy_free(uint8_t *ptr) {
-  size_t bucket, size, i;
+  size_t bucket, i;
 
   /*
    * We were given the address returned by "malloc" so get back to the actual
@@ -314,8 +314,8 @@ void buddy_free(uint8_t *ptr) {
    * look up the index of the node corresponding to this address.
    */
   ptr -= HEADER_SIZE;
-  get_bucket_and_size(*(size_t *)ptr + HEADER_SIZE, &bucket, &size);
-  i = node_for_ptr(ptr, bucket, size);
+  bucket = bucket_for_request(*(size_t *)ptr + HEADER_SIZE);
+  i = node_for_ptr(ptr, bucket);
 
   /*
    * Traverse up to the root node, flipping USED blocks to UNUSED and merging
@@ -343,10 +343,9 @@ void buddy_free(uint8_t *ptr) {
      * add the merged parent to its free list yet. That will be done once after
      * this loop is finished.
      */
-    list_remove(ptr_for_node(((i - 1) ^ 1) + 1, bucket, size));
+    list_remove((list_t *)ptr_for_node(((i - 1) ^ 1) + 1, bucket));
     i = (i - 1) / 2;
     bucket--;
-    size *= 2;
   }
 
   /*
@@ -355,7 +354,7 @@ void buddy_free(uint8_t *ptr) {
    * followed by a "malloc" of the same size to ideally use the same address
    * for better memory locality.
    */
-  list_push(&buckets[bucket], ptr_for_node(i, bucket, size));
+  list_push(&buckets[bucket], (list_t *)ptr_for_node(i, bucket));
 }
 
 /*
