@@ -301,7 +301,7 @@ void *malloc(size_t request) {
    * possible allocation size. More memory will be reserved later as needed.
    */
   if (base_ptr == NULL) {
-    base_ptr = max_ptr = sbrk(0);
+    base_ptr = max_ptr = (uint8_t *)sbrk(0);
     bucket_limit = BUCKET_COUNT - 1;
     update_max_ptr(base_ptr + sizeof(list_t));
     list_init(&buckets[BUCKET_COUNT - 1]);
@@ -416,13 +416,20 @@ void free(void *ptr) {
   size_t bucket, i;
 
   /*
+   * Ignore any attempts to free a NULL pointer.
+   */
+  if (!ptr) {
+    return;
+  }
+
+  /*
    * We were given the address returned by "malloc" so get back to the actual
    * address of the node by subtracting off the size of the block header. Then
    * look up the index of the node corresponding to this address.
    */
   ptr = (uint8_t *)ptr - HEADER_SIZE;
   bucket = bucket_for_request(*(size_t *)ptr + HEADER_SIZE);
-  i = node_for_ptr(ptr, bucket);
+  i = node_for_ptr((uint8_t *)ptr, bucket);
 
   /*
    * Traverse up to the root node, flipping USED blocks to UNUSED and merging
